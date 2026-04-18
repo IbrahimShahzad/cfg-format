@@ -7,11 +7,12 @@ import (
 )
 
 type printer struct {
-	src      []byte
-	cfg      *Config
-	out      strings.Builder
-	depth    int
-	lastChar byte
+	src       []byte
+	cfg       *Config
+	out       strings.Builder
+	depth     int
+	lastChar  byte
+	measuring bool // true inside measureNode; suppresses wrap decisions to avoid recursion
 }
 
 func newPrinter(src []byte, cfg *Config) *printer {
@@ -121,9 +122,10 @@ func (p *printer) printNode(n *sitter.Node) {
 		// String content may not be captured as child nodes — always use the
 		// raw source span, which includes quotes and escape sequences.
 		p.raw(p.content(n))
-	case "pseudo_variable":
-		// Pseudo-variable subtrees (especially $xml, $sel) may have xpath/selector
-		// content that is not fully captured as child nodes. Emit verbatim.
+	case "pseudo_variable", "pvar_expression":
+		// Emit verbatim: subtrees may have content not fully captured as child
+		// nodes (xpath paths, transformation separators like the "." in
+		// {s.select,0,.}), so reconstructing from children would silently drop bytes.
 		p.raw(p.content(n))
 	case "file_starter":
 		// #!KAMAILIO — content spans the whole header, not just "#!"
@@ -165,21 +167,34 @@ func (p *printer) printFallback(n *sitter.Node) {
 // ── Top-level ────────────────────────────────────────────────────────────────
 
 func (p *printer) printSourceFile(n *sitter.Node) {
+	isComment := func(t string) bool {
+		return t == "comment" || t == "multiline_comment"
+	}
+	isRoute := func(t string) bool { return t == "routing_block" }
+	childInner := func(i int) string {
+		if i >= 0 && i < int(n.ChildCount()) {
+			return innerType(n.Child(i))
+		}
+		return ""
+	}
+
 	prevInner := ""
 	for i := range int(n.ChildCount()) {
 		child := n.Child(i)
 		curInner := innerType(child)
 
 		if i > 0 {
-			isComment := func(t string) bool {
-				return t == "comment" || t == "multiline_comment"
-			}
 			switch {
-			case curInner == "routing_block" && isComment(prevInner):
-				// Doc comment directly above a route block — keep them
-				// together with a single newline, no blank gap.
+			case isRoute(curInner) && isComment(prevInner):
+				// Doc comment attached to a route — keep them together.
 				p.raw("\n")
-			case curInner == "routing_block", prevInner == "routing_block":
+			case isRoute(curInner), isRoute(prevInner):
+				// Before or after any route (no doc comment above): 2 blank lines.
+				p.blankLine()
+				p.blankLine()
+			case isComment(curInner) && isRoute(childInner(i+1)):
+				// Comment is a doc string for the next route — 2 blank lines
+				// go before the comment, not between the comment and the route.
 				p.blankLine()
 				p.blankLine()
 			default:
@@ -195,25 +210,46 @@ func (p *printer) printSourceFile(n *sitter.Node) {
 // ── Preprocessor conditionals ────────────────────────────────────────────────
 
 func (p *printer) printPreprocIfdef(n *sitter.Node) {
+	var prevEnd uint32
 	for i := range int(n.ChildCount()) {
 		child := n.Child(i)
 		switch child.Type() {
 		case "#!ifdef", "#!ifndef":
-			// Directive keyword — already on the current line (caller did nl()).
 			p.raw(p.content(child))
+			prevEnd = child.EndByte()
 		case "identifier":
-			// The condition name: #!ifdef <IDENTIFIER>
 			p.raw(" " + p.content(child))
+			prevEnd = child.EndByte()
 		case "#!endif":
 			p.raw("\n")
 			p.raw(p.content(child))
-		case "#!else":
+		case "preproc_else":
+			// #!else is a named node wrapping the else-branch body.
+			// The #!else keyword must be at column 0; body is reformatted.
 			p.raw("\n")
-			p.raw(p.content(child))
+			p.raw(p.content(child.Child(0))) // "#!else"
+			var elseEnd uint32 = child.Child(0).EndByte()
+			for j := 1; j < int(child.ChildCount()); j++ {
+				body := child.Child(j)
+				if isBareStmt(body, ";") {
+					p.raw(";")
+				} else {
+					p.emitBlanks(elseEnd, body.StartByte())
+					p.nl()
+					p.printNode(body)
+				}
+				elseEnd = body.EndByte()
+			}
+			prevEnd = child.EndByte()
 		default:
-			// Body statements — format at current indentation level.
-			p.nl()
-			p.printNode(child)
+			if isBareStmt(child, ";") {
+				p.raw(";")
+			} else {
+				p.emitBlanks(prevEnd, child.StartByte())
+				p.nl()
+				p.printNode(child)
+			}
+			prevEnd = child.EndByte()
 		}
 	}
 }
@@ -284,29 +320,34 @@ func (p *printer) printCompoundStatement(n *sitter.Node) {
 	p.raw("{")
 	p.depth++
 
-	prevWasInline := false // was previous child emitted without a trailing newline?
+	var prevEnd uint32
 	for i := range int(n.ChildCount()) {
 		child := n.Child(i)
 		switch child.Type() {
-		case "block_start", "block_end":
-			prevWasInline = false
+		case "block_start":
+			prevEnd = child.EndByte()
+		case "block_end":
+			// skip — closing } is emitted after the loop
 		case "comment", "multiline_comment":
+			p.emitBlanks(prevEnd, child.StartByte())
 			p.nl()
 			p.raw(p.content(child))
-			prevWasInline = false
+			prevEnd = child.EndByte()
 		default:
-			if prevWasInline && isBareStmt(child, ";") {
+			if isBareStmt(child, ";") {
+				// Semicolon is a statement terminator — attach to previous line.
 				p.raw(";")
-				prevWasInline = false
-			} else if isPreproc(child.Type()) {
-				// Preprocessor directives are always at column 0, like in C.
+				prevEnd = child.EndByte()
+			} else if isPreproc(child.Type()) || isPreprocError(child, p.src) {
+				p.emitBlanks(prevEnd, child.StartByte())
 				p.raw("\n")
 				p.printNode(child)
-				prevWasInline = false
+				prevEnd = child.EndByte()
 			} else {
+				p.emitBlanks(prevEnd, child.StartByte())
 				p.nl()
 				p.printNode(child)
-				prevWasInline = (child.Type() == "route_call")
+				prevEnd = child.EndByte()
 			}
 		}
 	}
@@ -314,6 +355,34 @@ func (p *printer) printCompoundStatement(n *sitter.Node) {
 	p.depth--
 	p.nl()
 	p.raw("}")
+}
+
+// emitBlanks emits blank lines found between src[from:to], preserving the
+// blank lines that existed in the source. Only the whitespace-only content of
+// those lines is stripped (handled later by result()).
+func (p *printer) emitBlanks(from, to uint32) {
+	for range srcBlanks(p.src, from, to) {
+		p.raw("\n")
+	}
+}
+
+// srcBlanks counts blank lines in src[from:to].
+// The first newline is the EOL of the previous item; each additional one is a
+// blank line.
+func srcBlanks(src []byte, from, to uint32) int {
+	if from >= to {
+		return 0
+	}
+	n := 0
+	for _, b := range src[from:to] {
+		if b == '\n' {
+			n++
+		}
+	}
+	if n > 0 {
+		n--
+	}
+	return n
 }
 
 // isBareStmt returns true when n is a statement node whose only child is an
@@ -334,6 +403,15 @@ func isPreproc(nodeType string) bool {
 		return true
 	}
 	return false
+}
+
+// isPreprocError returns true when an ERROR node contains a #! directive.
+// The grammar emits ERROR for unmatched #!endif / #!else at certain positions.
+func isPreprocError(n *sitter.Node, src []byte) bool {
+	if n.Type() != "ERROR" {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(string(src[n.StartByte():n.EndByte()])), "#!")
 }
 
 // ── Control flow ─────────────────────────────────────────────────────────────
@@ -424,24 +502,82 @@ func (p *printer) printSwitchStatement(n *sitter.Node) {
 		case "parenthesized_expression":
 			p.raw(" ")
 			p.printParenExpr(child)
-		case "block_start":
-			p.raw(" {")
-			p.depth++
-		case "block_end":
-			p.depth--
-			p.nl()
-			p.raw("}")
-		case "case_statement":
-			p.nl()
-			p.printCaseStatement(child)
+		case "compound_statement":
+			p.raw(" ")
+			p.printSwitchBody(child)
 		default:
 			p.printFallback(child)
 		}
 	}
 }
 
+// printSwitchBody prints the compound_statement inside a switch, managing
+// case-label indent vs case-body indent separately.
+//
+// Grammar quirk: each case_statement is wrapped in a statement node and
+// contains only its label + the first statement. All subsequent statements
+// up to the next case label are siblings in the compound_statement.
+func (p *printer) printSwitchBody(n *sitter.Node) {
+	p.raw("{")
+	p.depth++ // inside the block
+
+	inCaseBody := false
+	var prevEnd uint32
+
+	for i := range int(n.ChildCount()) {
+		child := n.Child(i)
+		switch child.Type() {
+		case "block_start":
+			prevEnd = child.EndByte()
+		case "block_end":
+			// skip
+		case "comment", "multiline_comment":
+			p.emitBlanks(prevEnd, child.StartByte())
+			p.nl()
+			p.raw(p.content(child))
+			prevEnd = child.EndByte()
+		default:
+			if isCaseLabel(child) {
+				if inCaseBody {
+					p.depth-- // close previous case body
+				}
+				p.emitBlanks(prevEnd, child.StartByte())
+				p.nl()
+				p.printCaseStatement(child.NamedChild(0))
+				p.depth++ // open case body
+				inCaseBody = true
+			} else if isBareStmt(child, ";") {
+				p.raw(";")
+			} else if isPreproc(child.Type()) || isPreprocError(child, p.src) {
+				p.emitBlanks(prevEnd, child.StartByte())
+				p.raw("\n")
+				p.printNode(child)
+			} else {
+				p.emitBlanks(prevEnd, child.StartByte())
+				p.nl()
+				p.printNode(child)
+			}
+			prevEnd = child.EndByte()
+		}
+	}
+
+	if inCaseBody {
+		p.depth--
+	}
+	p.depth--
+	p.nl()
+	p.raw("}")
+}
+
+// isCaseLabel returns true when n is a statement node whose sole named child
+// is a case_statement (i.e. a case/default label in a switch body).
+func isCaseLabel(n *sitter.Node) bool {
+	return n.Type() == "statement" &&
+		n.NamedChildCount() == 1 &&
+		n.NamedChild(0).Type() == "case_statement"
+}
+
 func (p *printer) printCaseStatement(n *sitter.Node) {
-	// Emit label at current indent then indent body one extra level.
 	passedColon := false
 	for i := range int(n.ChildCount()) {
 		child := n.Child(i)
@@ -455,6 +591,9 @@ func (p *printer) printCaseStatement(n *sitter.Node) {
 				p.raw(" ")
 			}
 			p.raw(p.content(child))
+		case child.Type() == ";":
+			// Semicolon terminates the inline statement — no newline.
+			p.raw(";")
 		default:
 			p.nl()
 			p.printNode(child)
@@ -521,8 +660,23 @@ func (p *printer) printTopLevelAssignment(n *sitter.Node) {
 }
 
 func (p *printer) printBinaryExpr(n *sitter.Node) {
-	// Structure: left  operator  right
-	// Operator is an anonymous (unnamed) node in the middle position.
+	if !p.measuring && int(n.ChildCount()) >= 3 {
+		single := p.measureNode(n)
+		if p.approxLineLen()+len(single) > p.cfg.PrintWidth {
+			rootOp := p.content(n.Child(1))
+			operands, ops := p.collectBinaryChain(n, rootOp)
+			if len(ops) > 0 {
+				contIndent := p.indentStr() + p.contUnit()
+				p.printNode(operands[0])
+				for i, op := range ops {
+					p.raw("\n" + contIndent + op + " ")
+					p.printNode(operands[i+1])
+				}
+				return
+			}
+		}
+	}
+	// Inline: spaces around the operator token in the middle position.
 	count := int(n.ChildCount())
 	for i := range count {
 		child := n.Child(i)
@@ -532,6 +686,23 @@ func (p *printer) printBinaryExpr(n *sitter.Node) {
 			p.printNode(child)
 		}
 	}
+}
+
+// collectBinaryChain flattens a left-associative chain of the same binary
+// operator into a flat slice of operands and the repeated operator between them.
+//
+//	"a" + "b" + "c"  →  operands=["a","b","c"]  ops=["+","+"]
+func (p *printer) collectBinaryChain(n *sitter.Node, op string) (operands []*sitter.Node, ops []string) {
+	for n.Type() == "expression" && n.NamedChildCount() == 1 {
+		n = n.NamedChild(0)
+	}
+	if n.Type() == "binary_expression" && int(n.ChildCount()) >= 3 {
+		if p.content(n.Child(1)) == op {
+			leftOperands, leftOps := p.collectBinaryChain(n.Child(0), op)
+			return append(leftOperands, n.Child(2)), append(leftOps, op)
+		}
+	}
+	return []*sitter.Node{n}, nil
 }
 
 func (p *printer) printUnaryExpr(n *sitter.Node) {
@@ -607,8 +778,17 @@ func (p *printer) contUnit() string {
 
 // measureNode renders n to a temporary buffer and returns the text.
 // Used to check single-line width before deciding to wrap.
+//
+// The temporary printer must have measuring=true; otherwise nested
+// printBinaryExpr / printParenOrWrap calls will recurse back into
+// measureNode on the same node and blow the stack.
 func (p *printer) measureNode(n *sitter.Node) string {
-	tmp := &printer{src: p.src, cfg: p.cfg}
+	tmp := &printer{
+		src:       p.src,
+		cfg:       p.cfg,
+		depth:     p.depth,
+		measuring: true,
+	}
 	tmp.printNode(n)
 	s := tmp.out.String()
 	// Only keep the first line (in case of multi-line sub-nodes).
