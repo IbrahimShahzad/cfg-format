@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"cfg-format/formatter"
+
 	"golang.org/x/term"
 )
 
@@ -17,7 +18,7 @@ func main() {
 		dumpTree     = flag.Bool("dump-tree", false, "print the parse tree and exit (debug)")
 		useSpaces    = flag.Bool("spaces", true, "use spaces instead of tabs for indentation")
 		indentWidth  = flag.Int("indent", 4, "indent width (only used with -spaces)")
-		printWidth   = flag.Int("width", 79, "max line length before if/while conditions are wrapped")
+		printWidth   = flag.Int("width", 80, "max line length before if/while conditions are wrapped")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: cfg-format [flags] [file ...]\n")

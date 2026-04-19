@@ -259,10 +259,14 @@ func srcNewlines(src []byte, from, to uint32) int {
 // ── Preprocessor conditionals ────────────────────────────────────────────────
 
 func (p *printer) printPreprocIfdef(n *sitter.Node) {
-	if preprocHasErrorChild(n) {
-		// The #!ifdef crosses structural block boundaries (e.g. wraps } else {).
-		// Reformatting would produce wrong output — emit the body verbatim and
-		// only ensure the directive lines start at column 0.
+	if preprocHasErrorChild(n) || (p.depth > 0 && preprocHasNestedRoute(n)) {
+		// Two cases both require verbatim output:
+		//  1. The #!ifdef crosses structural block boundaries (e.g. wraps "} else {").
+		//  2. Tree-sitter error recovery swallowed a subsequent routing_block into
+		//     this #!ifdef body (happens when a split-ifdef pattern is followed by
+		//     another route). A routing_block inside a compound_statement body
+		//     (depth > 0) is never valid; only possible via error recovery.
+		// In both cases reformatting would corrupt the structure, so emit verbatim.
 		p.printPreprocIfdefVerbatim(n)
 		return
 	}
@@ -322,8 +326,8 @@ func (p *printer) printPreprocIfdef(n *sitter.Node) {
 }
 
 // preprocHasErrorChild reports whether a preproc_ifdef/ifndef node (or its
-// preproc_else child) contains an ERROR node, which means the #!ifdef block
-// crosses structural boundaries like "} else {".
+// preproc_else child) contains an ERROR node as a direct child, which means
+// the #!ifdef block crosses structural boundaries like "} else {".
 func preprocHasErrorChild(n *sitter.Node) bool {
 	for i := range int(n.ChildCount()) {
 		child := n.Child(i)
@@ -336,6 +340,21 @@ func preprocHasErrorChild(n *sitter.Node) bool {
 					return true
 				}
 			}
+		}
+	}
+	return false
+}
+
+// preprocHasNestedRoute reports whether a preproc_ifdef/ifndef node has a
+// routing_block as a direct child. This only occurs via tree-sitter error
+// recovery when a split-ifdef pattern (wrapping "} else {") is followed by
+// another route definition — the parser greedily absorbs the next route into
+// the ifdef body to satisfy the grammar. A routing_block inside a
+// compound_statement is never semantically valid, so verbatim output is needed.
+func preprocHasNestedRoute(n *sitter.Node) bool {
+	for i := range int(n.ChildCount()) {
+		if n.Child(i).Type() == "routing_block" {
+			return true
 		}
 	}
 	return false
@@ -355,14 +374,19 @@ func (p *printer) printPreprocIfdefVerbatim(n *sitter.Node) {
 			p.raw(" " + p.content(child))
 			bodyStart = child.EndByte()
 		case "#!endif":
-			// Emit everything between the last directive and #!endif verbatim.
-			p.raw(string(p.src[bodyStart:child.StartByte()]))
+			// Emit the body verbatim, then the directive on its own line.
+			// Normalize to exactly one trailing newline so that the formatter
+			// is idempotent: the body naturally ends with \n (the source line
+			// ending before #!endif) and we must not emit a second one.
+			body := strings.TrimRight(string(p.src[bodyStart:child.StartByte()]), "\n")
+			p.raw(body)
 			p.raw("\n")
 			p.raw(p.content(child))
 		case "preproc_else":
 			elseToken := child.Child(0) // "#!else"
-			// Body up to #!else
-			p.raw(string(p.src[bodyStart:elseToken.StartByte()]))
+			// Body up to #!else — same trailing-newline normalisation.
+			body := strings.TrimRight(string(p.src[bodyStart:elseToken.StartByte()]), "\n")
+			p.raw(body)
 			p.raw("\n")
 			p.raw(p.content(elseToken))
 			bodyStart = elseToken.EndByte()
@@ -778,17 +802,21 @@ func (p *printer) printStatement(n *sitter.Node) {
 }
 
 func (p *printer) printReturnStatement(n *sitter.Node) {
-	// return_statement: "return" [expression] ";"
-	// Must emit a space between "return" and the optional value so that
-	// "return -1" doesn't become "return-1".
+	// return_statement can be:
+	//   "return" [expression] ";"          — explicit return with optional value
+	//   (core_function "exit"|"drop") ";"  — exit/drop statements
+	// The keyword part (return or core_function) must not get a leading space.
+	// Only the optional value expression gets a space before it.
 	for i := range int(n.ChildCount()) {
 		child := n.Child(i)
 		switch child.Type() {
-		case "return":
-			p.raw("return")
+		case "return", "core_function":
+			// keyword — emit raw content, no leading space
+			p.raw(p.content(child))
 		case ";":
 			p.raw(";")
 		default:
+			// value expression — needs a space separator
 			p.raw(" ")
 			p.printNode(child)
 		}
