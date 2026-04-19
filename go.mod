@@ -1,4 +1,4 @@
-module cfg-format
+module github.com/IbrahimShahzad/cfg-format
 
 go 1.25.0
 
